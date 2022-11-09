@@ -7,6 +7,8 @@ import { multer } from "../util/multer";
 import imageSize from "image-size";
 import ffmpeg from "fluent-ffmpeg";
 import Path from "path";
+import fs from "fs";
+import util from 'node:util';
 import { Duplex, Readable, Transform, Writable } from "stream";
 
 const router = Router();
@@ -41,6 +43,7 @@ router.post(
 			.replace(/[^a-zA-Z0-9._]+/g, "");
 		const id = Snowflake.generate();
 		const path = `attachments/${channel_id}/${id}/${filename}`;
+		const unproccessed = `attachments/${channel_id}/${id}/unproccessed-${filename}`;
 
 		const endpoint =
 			Config.get()?.cdn.endpointPublic || "http://localhost:3003";
@@ -54,26 +57,56 @@ router.post(
 				width = dimensions.width;
 				height = dimensions.height;
 			}
+
+			const file = {
+				id,
+				content_type: mimetype,
+				filename: filename,
+				size,
+				url: `${endpoint}/${path}`,
+				width,
+				height,
+			};
+	
+			return res.json(file);
 		}
 		else if (mimetype.includes("video") && process.env.FFPROBE_PATH) {
 			const root = process.env.STORAGE_LOCATION || "../";	// hmm, stolen from FileStorage
-			const out = await probe(Path.join(root, path));
-			const stream = out.streams[0];	// hmm
-			width = stream.width;
-			height = stream.height;
+			fs.rename(Path.join(root, path), Path.join(root, unproccessed), async () => {
+				ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH as string);
+				ffmpeg(Path.join(root, unproccessed)).outputOptions("-movflags faststart").outputOption("-c copy").output(Path.join(root, path)).on("end", async () => {
+					storage.delete(unproccessed);
+					const out = await probe(Path.join(root, path));
+					const stream = out.streams[0];	// hmm
+					width = stream.width;
+					height = stream.height;
+					
+					const file = {
+						id,
+						content_type: mimetype,
+						filename: filename,
+						size,
+						url: `${endpoint}/${path}`,
+						width,
+						height,
+					};
+			
+					return res.json(file);
+				}).run();
+			});
+		} else {
+			const file = {
+				id,
+				content_type: mimetype,
+				filename: filename,
+				size,
+				url: `${endpoint}/${path}`,
+				width,
+				height,
+			};
+	
+			return res.json(file);
 		}
-
-		const file = {
-			id,
-			content_type: mimetype,
-			filename: filename,
-			size,
-			url: `${endpoint}/${path}`,
-			width,
-			height,
-		};
-
-		return res.json(file);
 	},
 );
 
