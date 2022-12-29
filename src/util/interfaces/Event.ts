@@ -48,6 +48,7 @@ export interface PublicRelationship {
 
 export interface ReadyEventData {
 	v: number;
+	_trace: [string],
 	user: PublicUser & {
 		mobile: boolean;
 		desktop: boolean;

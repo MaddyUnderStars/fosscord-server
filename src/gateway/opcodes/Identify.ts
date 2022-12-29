@@ -24,6 +24,7 @@ import {
 	UserGuildSettings,
 	ReadyGuildDTO,
 	Guild,
+	Channel,
 } from "@fosscord/util";
 import { Send } from "../util/Send";
 import { CLOSECODES, OPCODES } from "../util/Constants";
@@ -38,170 +39,218 @@ import { Recipient } from "@fosscord/util";
 // TODO: check privileged intents, if defined in the config
 // TODO: check if already identified
 
+class Tracer {
+	data: any = [];
+
+	trace = async (name: string, callback: (tracer: Tracer) => any) => {
+		this.data.push(name);
+		this.data.push({
+			micros: performance.now(),
+			calls: [],
+		});
+		const index = this.data.length - 1;
+		const tracer = new Tracer();
+		var ret = await callback(tracer);
+		this.data[index].calls = tracer.data;
+		this.data[index].micros = (performance.now() - this.data[index].micros) * 1000;
+		return ret;
+	};
+}
+
 export async function onIdentify(this: WebSocket, data: Payload) {
+	const identify: IdentifySchema = data.d;
+	let user!: User,
+		read_states!: ReadState[],
+		members!: Member[],
+		recipients!: Recipient[],
+		session!: Session,
+		application!: Application | null,
+		channels!: Channel[],
+		user_guild_settings_entries!: any[],
+		users: PublicUser[] = [],
+		merged_members!: any[],
+		guilds!: any[];
+
 	clearTimeout(this.readyTimeout);
 	// TODO: is this needed now that we use `json-bigint`?
 	if (typeof data.d?.client_state?.highest_last_message_id === "number")
 		data.d.client_state.highest_last_message_id += "";
 	check.call(this, IdentifySchema, data.d);
 
-	const identify: IdentifySchema = data.d;
+	const tracer = new Tracer();
+	await tracer.trace(Config.get().gateway.endpointPublic + "-"
+		+ (process.env.NODE_ENV == "production" ? "prd" : "dev") + "-"
+		+ process.pid,
+		async (tracer) => {
+			await tracer.trace("user_auth", async (tracer) => {
+				try {
+					const { jwtSecret } = Config.get().security;
+					var { decoded } = await checkToken(identify.token, jwtSecret); // will throw an error if invalid
+				} catch (error) {
+					console.error("invalid token", error);
+					return this.close(CLOSECODES.Authentication_failed);
+				}
+				this.user_id = decoded.id;
+			});
 
-	try {
-		const { jwtSecret } = Config.get().security;
-		var { decoded } = await checkToken(identify.token, jwtSecret); // will throw an error if invalid
-	} catch (error) {
-		console.error("invalid token", error);
-		return this.close(CLOSECODES.Authentication_failed);
-	}
-	this.user_id = decoded.id;
+			const session_id = genSessionId();
+			this.session_id = session_id; //Set the session of the WebSocket object
 
-	const session_id = genSessionId();
-	this.session_id = session_id; //Set the session of the WebSocket object
+			await tracer.trace("fetch", async (tracer) => {
+				[user, read_states, members, recipients, session, application] =
+					await Promise.all([
+						tracer.trace("get_user", () => User.findOneOrFail({
+							where: { id: this.user_id },
+							relations: ["relationships", "relationships.to", "settings"],
+							select: [...PrivateUserProjection, "relationships"],
+						})),
+						tracer.trace("get_read_state", () => ReadState.find({ where: { user_id: this.user_id } })),
+						tracer.trace("get_memberships", () => Member.find({
+							where: { id: this.user_id },
+							select: MemberPrivateProjection,
+							relations: [
+								"guild",
+								"guild.channels",
+								"guild.emojis",
+								"guild.emojis.user",
+								"guild.roles",
+								"guild.stickers",
+								"user",
+								"roles",
+							],
+						})),
+						tracer.trace("get_private_channels", () => Recipient.find({
+							where: { user_id: this.user_id, closed: false },
+							relations: [
+								"channel",
+								"channel.recipients",
+								"channel.recipients.user",
+							],
+							// TODO: public user selection
+						})),
+						// save the session and delete it when the websocket is closed
+						tracer.trace("create_session", () => Session.create({
+							user_id: this.user_id,
+							session_id: this.session_id,
+							// TODO: check if status is only one of: online, dnd, offline, idle
+							status: identify.presence?.status || "offline", //does the session always start as online?
+							client_info: {
+								//TODO read from identity
+								client: "desktop",
+								os: identify.properties?.os,
+								version: 0,
+							},
+							activities: [],
+						}).save()),
+						tracer.trace("get_application", () => Application.findOne({ where: { id: this.user_id } })),
+					]);
+			});
 
-	const [user, read_states, members, recipients, session, application] =
-		await Promise.all([
-			User.findOneOrFail({
-				where: { id: this.user_id },
-				relations: ["relationships", "relationships.to", "settings"],
-				select: [...PrivateUserProjection, "relationships"],
-			}),
-			ReadState.find({ where: { user_id: this.user_id } }),
-			Member.find({
-				where: { id: this.user_id },
-				select: MemberPrivateProjection,
-				relations: [
-					"guild",
-					"guild.channels",
-					"guild.emojis",
-					"guild.emojis.user",
-					"guild.roles",
-					"guild.stickers",
-					"user",
-					"roles",
-				],
-			}),
-			Recipient.find({
-				where: { user_id: this.user_id, closed: false },
-				relations: [
-					"channel",
-					"channel.recipients",
-					"channel.recipients.user",
-				],
-				// TODO: public user selection
-			}),
-			// save the session and delete it when the websocket is closed
-			Session.create({
-				user_id: this.user_id,
-				session_id: session_id,
-				// TODO: check if status is only one of: online, dnd, offline, idle
-				status: identify.presence?.status || "offline", //does the session always start as online?
-				client_info: {
-					//TODO read from identity
-					client: "desktop",
-					os: identify.properties?.os,
-					version: 0,
-				},
-				activities: [],
-			}).save(),
-			Application.findOne({ where: { id: this.user_id } }),
-		]);
-
-	if (!user) return this.close(CLOSECODES.Authentication_failed);
-	if (!user.settings) {
-		user.settings = new UserSettings();
-		await user.settings.save();
-	}
-
-	if (!identify.intents) identify.intents = BigInt("0x6ffffffff");
-	this.intents = new Intents(identify.intents);
-	if (identify.shard) {
-		this.shard_id = identify.shard[0];
-		this.shard_count = identify.shard[1];
-		if (
-			this.shard_count == null ||
-			this.shard_id == null ||
-			this.shard_id >= this.shard_count ||
-			this.shard_id < 0 ||
-			this.shard_count <= 0
-		) {
-			console.log(identify.shard);
-			return this.close(CLOSECODES.Invalid_shard);
-		}
-	}
-	var users: PublicUser[] = [];
-
-	const merged_members = members.map((x: Member) => {
-		return [
-			{
-				...x,
-				roles: x.roles.map((x) => x.id),
-				settings: undefined,
-				guild: undefined,
-			},
-		];
-	}) as PublicMember[][];
-	let guilds = members.map((x) => ({ ...x.guild, joined_at: x.joined_at }));
-
-	// @ts-ignore
-	guilds = guilds.map((guild) => {
-		if (user.bot) {
-			setTimeout(() => {
-				var promise = Send(this, {
-					op: OPCODES.Dispatch,
-					t: EVENTEnum.GuildCreate,
-					s: this.sequence++,
-					d: guild,
+			if (!user) return this.close(CLOSECODES.Authentication_failed);
+			if (!user.settings) {
+				await tracer.trace("save_settings", async () => {
+					user.settings = new UserSettings();
+					await user.settings.save();
 				});
-				if (promise) promise.catch(console.error);
-			}, 500);
-			return { id: guild.id, unavailable: true };
-		}
+			}
 
-		return guild;
-	});
+			if (!identify.intents) identify.intents = BigInt("0x6ffffffff");
+			this.intents = new Intents(identify.intents);
+			if (identify.shard) {
+				this.shard_id = identify.shard[0];
+				this.shard_count = identify.shard[1];
+				if (
+					this.shard_count == null ||
+					this.shard_id == null ||
+					this.shard_id >= this.shard_count ||
+					this.shard_id < 0 ||
+					this.shard_count <= 0
+				) {
+					console.log(identify.shard);
+					return this.close(CLOSECODES.Invalid_shard);
+				}
+			}
 
-	// TODO: Rewrite this. Perhaps a DTO?
-	const user_guild_settings_entries = members.map((x) => ({
-		...DefaultUserGuildSettings,
-		...x.settings,
-		guild_id: x.guild.id,
-		channel_overrides: Object.entries(
-			x.settings.channel_overrides ?? {},
-		).map((y) => ({
-			...y[1],
-			channel_id: y[0],
-		})),
-	})) as any as UserGuildSettings[];
+			await tracer.trace("build_ready", async () => {
+				merged_members = members.map((x: Member) => {
+					return [
+						{
+							...x,
+							roles: x.roles.map((x) => x.id),
+							settings: undefined,
+							guild: undefined,
+						},
+					];
+				}) as PublicMember[][];
+				guilds = members.map((x) => ({ ...x.guild, joined_at: x.joined_at }));
 
-	const channels = recipients.map((x) => {
-		// @ts-ignore
-		x.channel.recipients = x.channel.recipients?.map((x) => x.user);
-		//TODO is this needed? check if users in group dm that are not friends are sent in the READY event
-		users = users.concat(x.channel.recipients as unknown as User[]);
-		if (x.channel.isDm()) {
-			x.channel.recipients = x.channel.recipients!.filter(
-				(x) => x.id !== this.user_id,
-			);
-		}
-		return x.channel;
-	});
+				// @ts-ignore
+				guilds = guilds.map((guild) => {
+					if (user.bot) {
+						setTimeout(() => {
+							var promise = Send(this, {
+								op: OPCODES.Dispatch,
+								t: EVENTEnum.GuildCreate,
+								s: this.sequence++,
+								d: guild,
+							});
+							if (promise) promise.catch(console.error);
+						}, 500);
+						return { id: guild.id, unavailable: true };
+					}
 
-	for (let relation of user.relationships) {
-		const related_user = relation.to;
-		const public_related_user = {
-			username: related_user.username,
-			discriminator: related_user.discriminator,
-			id: related_user.id,
-			public_flags: related_user.public_flags,
-			avatar: related_user.avatar,
-			bot: related_user.bot,
-			bio: related_user.bio,
-			premium_since: user.premium_since,
-			accent_color: related_user.accent_color,
-		};
-		users.push(public_related_user);
-	}
+					return guild;
+				});
+
+				// TODO: Rewrite this. Perhaps a DTO?
+				user_guild_settings_entries = members.map((x) => ({
+					...DefaultUserGuildSettings,
+					...x.settings,
+					guild_id: x.guild.id,
+					channel_overrides: Object.entries(
+						x.settings.channel_overrides ?? {},
+					).map((y) => ({
+						...y[1],
+						channel_id: y[0],
+					})),
+				})) as any as UserGuildSettings[];
+
+				channels = recipients.map((x) => {
+					// @ts-ignore
+					x.channel.recipients = x.channel.recipients?.map((x) => x.user);
+					//TODO is this needed? check if users in group dm that are not friends are sent in the READY event
+					users = users.concat(x.channel.recipients as unknown as User[]);
+					if (x.channel.isDm()) {
+						x.channel.recipients = x.channel.recipients!.filter(
+							(x) => x.id !== this.user_id,
+						);
+					}
+					return x.channel;
+				});
+
+				for (let relation of user.relationships) {
+					const related_user = relation.to;
+					const public_related_user = {
+						username: related_user.username,
+						discriminator: related_user.discriminator,
+						id: related_user.id,
+						public_flags: related_user.public_flags,
+						avatar: related_user.avatar,
+						bot: related_user.bot,
+						bio: related_user.bio,
+						premium_since: user.premium_since,
+						accent_color: related_user.accent_color,
+					};
+					users.push(public_related_user);
+				}
+
+				read_states.forEach((s: any) => {
+					s.id = s.channel_id;
+					delete s.user_id;
+					delete s.channel_id;
+				});
+			});
+		});
 
 	setImmediate(async () => {
 		// run in seperate "promise context" because ready payload is not dependent on those events
@@ -223,12 +272,6 @@ export async function onIdentify(this: WebSocket, data: Payload) {
 				status: session.status,
 			},
 		} as PresenceUpdateEvent);
-	});
-
-	read_states.forEach((s: any) => {
-		s.id = s.channel_id;
-		delete s.user_id;
-		delete s.channel_id;
 	});
 
 	const privateUser = {
@@ -258,13 +301,14 @@ export async function onIdentify(this: WebSocket, data: Payload) {
 
 	const d: ReadyEventData = {
 		v: 9,
+		_trace: [JSON.stringify(tracer.data)],
 		application: { id: application?.id ?? '', flags: application?.flags ?? 0 }, //TODO: check this code!
 		user: privateUser,
 		user_settings: user.settings,
 		// @ts-ignore
 		guilds: guilds.map((x) => {
 			return {
-				...new ReadyGuildDTO(x as Guild & { joined_at: Date }).toJSON(),
+				...new ReadyGuildDTO(x as Guild & { joined_at: Date; }).toJSON(),
 				guild_hashes: {},
 				joined_at: x.joined_at
 			};
@@ -283,7 +327,7 @@ export async function onIdentify(this: WebSocket, data: Payload) {
 			version: 642,
 		},
 		private_channels: channels,
-		session_id: session_id,
+		session_id: this.session_id,
 		analytics_token: "", // TODO
 		connected_accounts: [], // TODO
 		consents: {
