@@ -26,41 +26,37 @@ async function getMembers(guild_id: string, range: [number, number]) {
 	}
 	// TODO: wait for typeorm to implement ordering for .find queries https://github.com/typeorm/typeorm/issues/2620
 
-	let members: Member[] = [];
-	try {
-		members = await getDatabase()!
-			.getRepository(Member)
-			.createQueryBuilder("member")
-			.where("member.guild_id = :guild_id", { guild_id })
-			.leftJoinAndSelect("member.roles", "role")
-			.leftJoinAndSelect("member.user", "user")
-			.leftJoinAndSelect("user.sessions", "session")
-			.addSelect("user.settings")
-			.addSelect(
-				"CASE WHEN session.status = 'offline' THEN 0 ELSE 1 END",
-				"_status",
-			)
-			.orderBy("role.position", "DESC")
-			.addOrderBy("_status", "DESC")
-			.addOrderBy("user.username", "ASC")
-			.offset(Number(range[0]) || 0)
-			.limit(Number(range[1]) || 100)
-			.getMany();
-	} catch (e) {
-		console.error(`LazyRequest`, e);
-	}
+	let members = await Member.find({
+		where: { guild_id },
+		relations: {
+			roles: true,
+			user: {
+				sessions: true,
+			}
+		},
+		order: {
+			roles: {
+				position: "DESC",
+			},
+			user: {
+				username: "ASC",
+			},
+		},
+		take: range[1] || 100,
+		skip: range[0] || 0,
+	});
 
 	if (!members) {
 		return {
 			items: [],
 			groups: [],
-			range: [],
+			range: range,
 			members: [],
 		};
 	}
 
-	const groups = [] as any[];
-	const items = [];
+	let groups = [];
+	let items = [];
 	const member_roles = members
 		.map((m) => m.roles)
 		.flat()
@@ -75,10 +71,9 @@ async function getMembers(guild_id: string, range: [number, number]) {
 	const offlineItems = [];
 
 	for (const role of member_roles) {
-		// @ts-ignore
 		const [role_members, other_members]: Member[][] = partition(
 			members,
-			(m: Member) => m.roles.find((r) => r.id === role.id),
+			(m) => !!m.roles.find((r) => r.id === role.id),
 		);
 		const group = {
 			count: role_members.length,
@@ -154,6 +149,9 @@ async function getMembers(guild_id: string, range: [number, number]) {
 		items.push(...offlineItems);
 	}
 
+	groups = groups.filter(x => x.count > 0);
+	items = items.filter((x: any) => x.group ? x.group.count > 0 : true);
+
 	return {
 		items,
 		groups,
@@ -178,7 +176,7 @@ export async function onLazyRequest(this: WebSocket, { d }: Payload) {
 	const ranges = channels![channel_id];
 	if (!Array.isArray(ranges)) throw new Error("Not a valid Array");
 
-	const member_count = await Member.count({ where: { guild_id } });
+	const member_count = await Member.count({ where: { guild_id } }) - 1;
 	const ops = await Promise.all(ranges.map((x) => getMembers(guild_id, x)));
 
 	// TODO: unsubscribe member_events that are not in op.members
@@ -196,10 +194,17 @@ export async function onLazyRequest(this: WebSocket, { d }: Payload) {
 		});
 	});
 
-	const groups = ops
-		.map((x) => x.groups)
-		.flat()
-		.unique();
+	const groupsWithDupes = ops.map(x => x.groups).flat();
+	const groups: { count: number, id: string }[] = [];
+	for (var group of groupsWithDupes) {
+		const index = groups.findIndex((x) => x.id == group.id);
+		if (index !== -1) {
+			groups[index].count += group.count;
+			continue;
+		}
+
+		groups.push(group);
+	}
 
 	return await Send(this, {
 		op: OPCODES.Dispatch,
@@ -222,15 +227,9 @@ export async function onLazyRequest(this: WebSocket, { d }: Payload) {
 	});
 }
 
-function partition<T>(array: T[], isValid: Function) {
-	// @ts-ignore
-	return array.reduce(
-		// @ts-ignore
-		([pass, fail], elem) => {
-			return isValid(elem)
-				? [[...pass, elem], fail]
-				: [pass, [...fail, elem]];
-		},
-		[[], []],
-	);
+/* https://stackoverflow.com/a/50636286 */
+function partition<T>(array: T[], filter: (elem: T) => boolean) {
+	let pass: T[] = [], fail: T[] = [];
+	array.forEach((e) => (filter(e) ? pass : fail).push(e));
+	return [pass, fail];
 }
