@@ -113,7 +113,7 @@ async function getMembers(guild_id: string, range: [number, number]) {
 				member: {
 					...member,
 					roles,
-					user: { ...member.user, sessions: undefined },
+					user: member.user.toPublicUser(),
 					presence: {
 						...session,
 						activities: session?.activities || [],
@@ -195,7 +195,7 @@ export async function onLazyRequest(this: WebSocket, { d }: Payload) {
 	});
 
 	const groupsWithDupes = ops.map(x => x.groups).flat();
-	const groups: { count: number, id: string }[] = [];
+	const groups: { count: number, id: string; }[] = [];
 	for (var group of groupsWithDupes) {
 		const index = groups.findIndex((x) => x.id == group.id);
 		if (index !== -1) {
@@ -204,6 +204,23 @@ export async function onLazyRequest(this: WebSocket, { d }: Payload) {
 		}
 
 		groups.push(group);
+	}
+
+	for (var opInx = 0; opInx < ops.length; opInx++) {
+		for (var itemInx = 0; itemInx < ops[opInx].items.length; itemInx++) {
+			if ("member" in ops[opInx].items[itemInx]) continue;
+
+			let foundGroup: number = -1;
+			//@ts-ignore
+			const foundOp = ops.findIndex(x => foundGroup = x.groups.findIndex(y => y.id == ops[opInx].items[itemInx].group.id));
+			if (foundOp === -1 || foundGroup === -1) continue;
+
+			//@ts-ignore
+			ops[foundOp].items[foundGroup].count += ops[opInx].items[itemInx].group.count;
+			
+			ops[opInx].items.splice(itemInx, 1);
+			itemInx--;
+		}
 	}
 
 	return await Send(this, {
