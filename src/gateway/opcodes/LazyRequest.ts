@@ -157,7 +157,11 @@ async function getMembers(guild_id: string, range: [number, number]) {
 		groups,
 		range,
 		members: items
-			.map((x) => ("member" in x ? { ...x.member, settings: undefined } : undefined))
+			.map((x) =>
+				"member" in x
+					? { ...x.member, settings: undefined }
+					: undefined,
+			)
 			.filter((x) => !!x),
 	};
 }

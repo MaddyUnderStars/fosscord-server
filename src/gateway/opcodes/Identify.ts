@@ -175,10 +175,11 @@ export async function onIdentify(this: WebSocket, data: Payload) {
 	})) as any as UserGuildSettings[];
 
 	const channels = recipients.map((x) => {
-		// @ts-ignore
-		x.channel.recipients = x.channel.recipients?.map((x) => x.user);
 		//TODO is this needed? check if users in group dm that are not friends are sent in the READY event
-		users = users.concat(x.channel.recipients as unknown as User[]);
+		users = users.concat(
+			x.channel.recipients?.map((x) => x.user.toPublicUser()) || [],
+		);
+		// users = users.concat(x.channel.recipients);
 		if (x.channel.isDm()) {
 			x.channel.recipients = x.channel.recipients!.filter(
 				(x) => x.id !== this.user_id,
@@ -259,7 +260,10 @@ export async function onIdentify(this: WebSocket, data: Payload) {
 
 	const d: ReadyEventData = {
 		v: 9,
-		application: { id: application?.id ?? '', flags: application?.flags ?? 0 }, //TODO: check this code!
+		application: {
+			id: application?.id ?? "",
+			flags: application?.flags ?? 0,
+		}, //TODO: check this code!
 		user: privateUser,
 		user_settings: user.settings,
 		// @ts-ignore
@@ -267,7 +271,7 @@ export async function onIdentify(this: WebSocket, data: Payload) {
 			return {
 				...new ReadyGuildDTO(x as Guild & { joined_at: Date }).toJSON(),
 				guild_hashes: {},
-				joined_at: x.joined_at
+				joined_at: x.joined_at,
 			};
 		}),
 		guild_experiments: [], // TODO
