@@ -10,4 +10,10 @@ router.get("/", route({}), async (req: Request, res: Response) => {
 	res.json(await User.getPublicUser(id));
 });
 
+router.patch(
+	"/",
+	route({ right: "OPERATOR" }),
+	(req: Request, res: Response) => {},
+);
+
 export default router;
