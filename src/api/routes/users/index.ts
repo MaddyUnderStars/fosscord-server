@@ -26,7 +26,7 @@ router.get(
 							[sort as string]: Like(order),
 					  }
 					: undefined,
-			select: PublicUserProjection,
+			select: [...PublicUserProjection, "rights"],
 		});
 
 		return res.json({
