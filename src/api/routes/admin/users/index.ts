@@ -5,7 +5,6 @@ import { Like } from "typeorm";
 
 const router: Router = Router();
 
-/** Admin dashboard */
 router.get(
 	"/",
 	route({ right: "MANAGE_USERS" }),
