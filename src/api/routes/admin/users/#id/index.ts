@@ -14,13 +14,17 @@ import { route } from "@fosscord/api";
 
 const router: Router = Router();
 
-router.get("/", route({}), async (req: Request, res: Response) => {
-	const { id } = req.params;
+router.get(
+	"/",
+	route({ right: "MANAGE_USERS" }),
+	async (req: Request, res: Response) => {
+		const { id } = req.params;
 
-	const user = await User.getPublicUser(id, { select: ["rights"] });
+		const user = await User.getPublicUser(id, { select: ["rights"] });
 
-	res.json({ ...user.toPublicUser(), rights: user.rights });
-});
+		res.json({ ...user.toPublicUser(), rights: user.rights });
+	},
+);
 
 router.patch(
 	"/",
